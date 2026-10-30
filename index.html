@@ -1,0 +1,254 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<title>Campus map</title>
+<style>
+*{box-sizing:border-box}
+html,body{height:100%}
+body{margin:0;font:14px system-ui,sans-serif;color:#222;display:flex;flex-direction:column;background:#f6f6f4}
+button,select,input{font:inherit;padding:6px 10px;border:1px solid #aaa;border-radius:8px;background:#fff;color:#222}
+button{cursor:pointer}
+button.on{background:#222;color:#fff;border-color:#222}
+button.go{background:#0f6e56;color:#fff;border-color:#0f6e56}
+.row{display:flex;flex-wrap:wrap;gap:6px;align-items:center;padding:8px 10px;border-bottom:1px solid #ddd;background:#fff}
+#route input{flex:1 1 180px;min-width:0}
+#main{flex:1;display:flex;min-height:0}
+#svg{flex:1;min-width:0;background:#e9e9e6;touch-action:none;cursor:grab}
+#panel{width:290px;border-left:1px solid #ccc;padding:10px;overflow:auto;background:#fafaf8}
+#panel label{display:block;margin:8px 0 2px;color:#555;font-size:12px}
+#panel input,#panel select{width:100%}
+#steps{max-height:30vh;overflow:auto;padding:6px 10px;background:#fff;border-top:1px solid #ddd}
+#steps .st{display:flex;gap:8px;align-items:flex-start;padding:5px 0;border-bottom:1px solid #eee;cursor:pointer}
+#steps .st:last-child{border:0}
+#steps .dot{flex:none;width:22px;height:22px;border-radius:50%;background:#0f6e56;color:#fff;font-size:12px;display:flex;align-items:center;justify-content:center;margin-top:1px}
+#steps .st.cur{background:#f1f8f5}
+#msg{padding:6px 10px;color:#555;font-size:13px;background:#fff;border-top:1px solid #ddd}
+.nb{display:flex;justify-content:space-between;align-items:center;margin:2px 0;font-size:13px}
+.zoom{position:absolute;right:10px;bottom:10px;display:flex;flex-direction:column;gap:6px}
+.zoom button{width:38px;height:38px;padding:0;font-size:20px}
+#wrap{position:relative;flex:1;min-width:0;display:flex}
+.edit-only{display:none}
+body.edit .edit-only{display:flex}
+body.edit #panel{display:block}
+body:not(.edit) #panel{display:none}
+#live{display:none;padding:6px 10px;background:#eef4ff;border-top:1px solid #bcd}
+#live .lb{display:flex;flex-wrap:wrap;gap:6px;align-items:center;margin-top:6px}
+#where{display:none;margin-top:8px;padding:8px;background:#fff3cd;border-radius:8px}
+#where input{flex:1 1 160px;min-width:0}
+@media(max-width:700px){#panel{width:220px}}
+</style>
+</head>
+<body>
+<div class="row" id="route">
+<input id="from" list="pl" placeholder="From (for example C124)" autocomplete="off">
+<input id="to" list="pl" placeholder="To (for example B112)" autocomplete="off">
+<button class="go" id="go">Show route</button><button id="clr">Clear</button><button id="lv">Live</button>
+<datalist id="pl"></datalist>
+</div>
+<div class="row"><span id="blocks"></span><span id="floors"></span></div>
+<div class="row edit-only" id="tools">
+<span id="modes"></span>
+<label><input type="checkbox" id="lab" checked style="padding:0"> Labels</label>
+<button id="exp">Export JSON</button><button id="rst">Reset to original</button>
+</div>
+<div id="main">
+<div id="wrap"><svg id="svg" preserveAspectRatio="xMidYMid meet"></svg>
+<div class="zoom"><button id="zi">+</button><button id="zo">−</button><button id="zf" style="font-size:13px">Fit</button></div></div>
+<div id="panel"></div>
+</div>
+<div id="steps"></div>
+<div id="live">
+<div id="lstat"></div>
+<div class="lb"><button id="lst" style="display:none" class="go">I am on the next floor</button><button id="lset">Set direction</button><button id="lwh">Where am I?</button><button id="lstep">+1 step</button><button id="llog">Download log</button>
+<label>Sensitivity <input type="range" id="lth" min="0.4" max="3" step="0.1" value="1.2" style="width:90px;padding:0"> <span id="lthv">1.2</span></label></div>
+<div id="where"><span id="wtxt"></span><div class="lb"><input id="wi" list="pl" placeholder="Where are you now?"><button id="wgo" class="go">Re-route from here</button><button id="wok">I am on route</button></div></div>
+</div>
+<div id="msg"></div>
+<script>
+const EDIT=/[?&]edit/.test(location.search);
+if(EDIT)document.body.classList.add('edit');
+let G,blk,cur,mode='select',sel=null,pend=null,prev=null,route=null,vb=[0,0,1,1],cnt=0,places={};
+const svg=document.getElementById('svg'),panel=document.getElementById('panel'),msgEl=document.getElementById('msg'),stepsEl=document.getElementById('steps');
+const COL={room:'#1D9E75',toilet:'#D85A30',passage:'#888780',stairs:'#BA7517',connector:'#534AB7',lobby:'#378ADD',porch:'#378ADD'};
+const TYPES=['room','toilet','passage','stairs','connector','lobby','porch'];
+const MODES={select:'Select / move',add:'Add node',link:'Link two nodes',path:'Pathway',del:'Delete'};
+const HELP={select:'Drag a node to move it. Drag empty space to pan, wheel or buttons to zoom.',add:'Click empty space to add a node.',link:'Click a node, then a second node. Switch floor between clicks for stairs and bridges.',path:'Click along a corridor. Clicking a node or a link joins to it. Esc ends the path.',del:'Click a node or a link to delete it.'};
+const fl=id=>G.floors.find(f=>f.id===id);
+const nodeById=()=>Object.fromEntries(G.nodes.map(n=>[n.id,n]));
+const flab=id=>{const f=fl(id);return f.block+' Block, '+f.label.toLowerCase()};
+
+fetch('data/graph.json').then(r=>r.json()).then(g=>{
+ let s=null;try{s=EDIT?localStorage.getItem('campusGraph'):null}catch(e){}
+ G=g;if(s){try{const p=JSON.parse(s);if(p.version===g.version)G=p}catch(e){}}
+ G.nodes.forEach(n=>{const m=/_n(\d+)$/.exec(n.id);if(m)cnt=Math.max(cnt,+m[1])});
+ const blocks=[...new Set(G.floors.map(f=>f.block))];
+ document.getElementById('blocks').innerHTML=blocks.map(b=>`<button data-b="${b}">${b} Block</button>`).join(' ');
+ if(EDIT)document.getElementById('modes').innerHTML=Object.keys(MODES).map(m=>`<button data-m="${m}">${MODES[m]}</button>`).join(' ');
+ buildPlaces();setFloor(G.floors[0].id);
+ if(EDIT)setMode('select');else msg('Pick a start and an end, then press Show route.');
+});
+function save(){if(EDIT)try{localStorage.setItem('campusGraph',JSON.stringify(G))}catch(e){}}
+function msg(t){msgEl.textContent=t}
+function buildPlaces(){
+ places={};const used={},list=[];
+ G.nodes.filter(n=>n.type!=='passage'&&!(n.type==='stairs')).sort((a,b)=>a.floor.localeCompare(b.floor)||a.name.localeCompare(b.name)).forEach(n=>{
+  let l=n.name+' · '+n.floor.replace('_',' ').replace(/^(\w) (\w+)/,(m,b,f)=>b+' '+({G:'ground',RG:'R&D lower','1':'1st','2':'2nd','3':'3rd'}[f]||f));
+  used[l]=(used[l]||0)+1;if(used[l]>1)l+=' ('+used[l]+')';
+  places[l]=n.id;list.push(l)});
+ document.getElementById('pl').innerHTML=list.map(l=>`<option value="${l.replace(/"/g,'&quot;')}">`).join('');
+}
+function setFloor(id,keep){
+ cur=id;const f=fl(id);blk=f.block;if(!keep)vb=[0,0,f.w,f.h];
+ document.getElementById('floors').innerHTML=G.floors.filter(x=>x.block===blk).map(x=>`<button data-f="${x.id}" class="${x.id===id?'on':''}">${x.label}</button>`).join(' ');
+ document.querySelectorAll('#blocks button').forEach(b=>b.classList.toggle('on',b.dataset.b===blk));
+ render();
+}
+function setMode(m){mode=m;pend=null;prev=null;document.querySelectorAll('#modes button').forEach(b=>b.classList.toggle('on',b.dataset.m===m));msg(HELP[m]);render()}
+document.getElementById('blocks').onclick=e=>{const b=e.target.dataset.b;if(b)setFloor(G.floors.find(f=>f.block===b).id)};
+document.getElementById('floors').onclick=e=>{if(e.target.dataset.f)setFloor(e.target.dataset.f)};
+document.getElementById('modes').onclick=e=>{if(e.target.dataset.m)setMode(e.target.dataset.m)};
+document.getElementById('lab').onchange=render;
+const zoom=k=>{const cx=vb[0]+vb[2]/2,cy=vb[1]+vb[3]/2;vb[2]*=k;vb[3]*=k;vb[0]=cx-vb[2]/2;vb[1]=cy-vb[3]/2;render()};
+document.getElementById('zi').onclick=()=>zoom(1/1.4);
+document.getElementById('zo').onclick=()=>zoom(1.4);
+document.getElementById('zf').onclick=()=>{const f=fl(cur);vb=[0,0,f.w,f.h];render()};
+
+function scale(){return Math.max(vb[2]/svg.clientWidth,vb[3]/svg.clientHeight)}
+function svgPt(ev){const p=svg.createSVGPoint();p.x=ev.clientX;p.y=ev.clientY;const q=p.matrixTransform(svg.getScreenCTM().inverse());return{x:q.x,y:q.y}}
+function nid(){let i;do{i=cur+'_n'+(++cnt)}while(G.nodes.some(n=>n.id===i));return i}
+function addEdge(a,b){if(a===b||G.edges.some(e=>(e.a===a&&e.b===b)||(e.a===b&&e.b===a)))return;const nd=nodeById(),e={a,b};if(nd[a].floor!==nd[b].floor)e.w=60;G.edges.push(e);save()}
+function addNode(p,type,name){const n={id:nid(),floor:cur,name,type,x:Math.round(p.x),y:Math.round(p.y)};G.nodes.push(n);save();return n.id}
+function delNode(id){G.nodes=G.nodes.filter(n=>n.id!==id);G.edges=G.edges.filter(e=>e.a!==id&&e.b!==id);if(sel===id)sel=null;if(prev===id)prev=null;if(pend===id)pend=null;save()}
+function splitEdge(i,p){const nd=nodeById(),e=G.edges[i],a=nd[e.a],b=nd[e.b],dx=b.x-a.x,dy=b.y-a.y;let t=((p.x-a.x)*dx+(p.y-a.y)*dy)/(dx*dx+dy*dy);t=Math.max(.05,Math.min(.95,t));const id=addNode({x:a.x+t*dx,y:a.y+t*dy},'passage','Passage');G.edges.splice(i,1);addEdge(e.a,id);addEdge(id,e.b);return id}
+function pathTo(id){if(prev&&prev!==id)addEdge(prev,id);prev=id;sel=id}
+
+let down=null,drag=null;
+svg.addEventListener('pointerdown',ev=>{
+ if(ev.button>0&&ev.button!==2)return;
+ const t=ev.target,id=t.dataset&&t.dataset.id;
+ down={x:ev.clientX,y:ev.clientY,vb:[...vb],moved:false,target:t,p:svgPt(ev),right:ev.button===2};
+ if(EDIT&&id&&mode==='select'&&!down.right){drag=id;sel=id;refreshPanel();render()}
+ svg.setPointerCapture(ev.pointerId);
+});
+svg.addEventListener('pointermove',ev=>{
+ if(!down)return;
+ if(drag){const p=svgPt(ev),n=G.nodes.find(n=>n.id===drag);n.x=Math.round(p.x);n.y=Math.round(p.y);down.moved=true;render();return}
+ if(Math.hypot(ev.clientX-down.x,ev.clientY-down.y)>4)down.moved=true;
+ if(down.moved){const k=Math.max(down.vb[2]/svg.clientWidth,down.vb[3]/svg.clientHeight);vb[0]=down.vb[0]-(ev.clientX-down.x)*k;vb[1]=down.vb[1]-(ev.clientY-down.y)*k;render()}
+});
+svg.addEventListener('pointerup',ev=>{
+ if(!down)return;const d=down;down=null;
+ if(drag){drag=null;save();return}
+ if(d.moved||!EDIT)return;
+ const t=d.target,id=t.dataset&&t.dataset.id,p=d.p;
+ if(id){
+  if(mode==='select')sel=id;
+  else if(mode==='link'){if(!pend){pend=id;msg('From: '+G.nodes.find(n=>n.id===id).name+'. Now click the second node.')}else{addEdge(pend,id);pend=null;msg(HELP.link)}sel=id}
+  else if(mode==='del')delNode(id);
+  else if(mode==='path')pathTo(id);
+ }else if(t.dataset&&t.dataset.e!==undefined){
+  const i=+t.dataset.e;
+  if(mode==='del'){G.edges.splice(i,1);save()}else if(mode==='path')pathTo(splitEdge(i,p));
+ }else{
+  if(mode==='add')sel=addNode(p,'room','New node');
+  else if(mode==='path')pathTo(addNode(p,'passage','Passage'));
+  else if(mode==='select')sel=null;
+ }
+ refreshPanel();render();
+});
+svg.oncontextmenu=e=>e.preventDefault();
+svg.onwheel=ev=>{ev.preventDefault();const p=svgPt(ev),f=ev.deltaY>0?1.15:1/1.15;vb[0]=p.x-(p.x-vb[0])*f;vb[1]=p.y-(p.y-vb[1])*f;vb[2]*=f;vb[3]*=f;render()};
+window.onkeydown=ev=>{
+ if(!EDIT||['INPUT','SELECT'].includes(ev.target.tagName))return;
+ if(ev.key==='Escape'){prev=null;pend=null;render()}
+ if(ev.key==='Delete'&&sel){delNode(sel);refreshPanel();render()}
+};
+
+function render(){
+ if(!G)return;
+ const f=fl(cur),nd=nodeById(),R=Math.max(10,f.w/110);
+ let h=`<image href="${f.image}" x="0" y="0" width="${f.w}" height="${f.h}"/>`;
+ const re=route?new Set(route.edges):new Set();
+ if(EDIT){
+  const ids=new Set(G.nodes.filter(n=>n.floor===cur).map(n=>n.id)),lab=document.getElementById('lab').checked;
+  G.edges.forEach((e,i)=>{if(ids.has(e.a)&&ids.has(e.b)){const a=nd[e.a],b=nd[e.b];h+=`<line x1="${a.x}" y1="${a.y}" x2="${b.x}" y2="${b.y}" stroke="#c0392b" stroke-width="4" opacity=".8"/><line data-e="${i}" x1="${a.x}" y1="${a.y}" x2="${b.x}" y2="${b.y}" stroke="transparent" stroke-width="20"/>`}});
+  G.nodes.forEach(n=>{if(n.floor!==cur)return;const r=n.type==='passage'?6:10;
+   h+=`<circle data-id="${n.id}" cx="${n.x}" cy="${n.y}" r="${r}" fill="${n.id===pend||n.id===prev?'#000':COL[n.type]||'#888'}" stroke="${n.id===sel?'#000':'#fff'}" stroke-width="${n.id===sel?4:2}"/>`;
+   if(lab&&n.type!=='passage')h+=`<text x="${n.x+12}" y="${n.y-10}" font-size="20" font-weight="600" fill="#111" stroke="#fff" stroke-width="5" paint-order="stroke" pointer-events="none">${n.name.split(' ')[0]}</text>`});
+ }
+ if(route){
+  let casing='',line='',marks='';
+  route.edges.forEach(i=>{const e=G.edges[i],a=nd[e.a],b=nd[e.b];if(a.floor===cur&&b.floor===cur){const s=`x1="${a.x}" y1="${a.y}" x2="${b.x}" y2="${b.y}"`;casing+=`<line ${s} stroke="#fff" stroke-width="${R*.9}" stroke-linecap="round"/>`;line+=`<line ${s} stroke="#e11d48" stroke-width="${R*.5}" stroke-linecap="round"/>`}});
+  const seq=route.nodes;
+  seq.forEach((id,k)=>{const n=nd[id];
+   [[seq[k-1],'in'],[seq[k+1],'out']].forEach(([o,w])=>{if(o&&n.floor===cur&&nd[o].floor!==cur){const up=fl(nd[o].floor).block!==n.floor[0]?null:G.floors.indexOf(fl(nd[o].floor))>G.floors.indexOf(fl(n.floor));
+    const lb=fl(nd[o].floor).block!==fl(n.floor).block?'to '+fl(nd[o].floor).block+' Block':(up?'Up to ':'Down to ')+fl(nd[o].floor).label.toLowerCase();
+    marks+=`<circle cx="${n.x}" cy="${n.y}" r="${R*.8}" fill="#534AB7" stroke="#fff" stroke-width="${R*.25}"/><text x="${n.x+R}" y="${n.y-R}" font-size="${R*1.5}" font-weight="700" fill="#2d2470" stroke="#fff" stroke-width="${R*.5}" paint-order="stroke">${lb}</text>`}})});
+  const s=nd[seq[0]],t=nd[seq[seq.length-1]];
+  if(s.floor===cur)marks+=`<circle cx="${s.x}" cy="${s.y}" r="${R}" fill="#0f6e56" stroke="#fff" stroke-width="${R*.3}"/><text x="${s.x+R*1.2}" y="${s.y+R*.6}" font-size="${R*1.6}" font-weight="700" fill="#0b4d3d" stroke="#fff" stroke-width="${R*.5}" paint-order="stroke">Start</text>`;
+  if(t.floor===cur)marks+=`<circle cx="${t.x}" cy="${t.y}" r="${R}" fill="#e11d48" stroke="#fff" stroke-width="${R*.3}"/><text x="${t.x+R*1.2}" y="${t.y+R*.6}" font-size="${R*1.6}" font-weight="700" fill="#9f1239" stroke="#fff" stroke-width="${R*.5}" paint-order="stroke">End</text>`;
+  h+=casing+line+marks;
+ }
+ if(typeof liveDraw==='function')h+=liveDraw(R)||'';
+ svg.setAttribute('viewBox',vb.join(' '));
+ svg.innerHTML=h;
+}
+
+function refreshPanel(){
+ if(!EDIT)return;
+ const n=G.nodes.find(x=>x.id===sel);
+ if(!n){panel.innerHTML='<p>Select a node to edit it.</p>';return}
+ const nd=nodeById();
+ const nb=G.edges.map((e,i)=>({e,i})).filter(x=>x.e.a===n.id||x.e.b===n.id).map(x=>{const o=nd[x.e.a===n.id?x.e.b:x.e.a];return`<div class="nb"><span>${o.name}${o.floor!==n.floor?' ['+o.floor+']':''}</span><button data-un="${x.i}">x</button></div>`}).join('');
+ panel.innerHTML=`<label>Id</label><input value="${n.id}" disabled><label>Name</label><input id="pn" value="${n.name.replace(/"/g,'&quot;')}"><label>Type</label><select id="pt">${TYPES.map(t=>`<option${t===n.type?' selected':''}>${t}</option>`).join('')}</select><label>Links</label>${nb||'<div>None</div>'}<p><button id="pd">Delete node</button></p>`;
+ document.getElementById('pn').onchange=e=>{n.name=e.target.value;save();buildPlaces();render()};
+ document.getElementById('pt').onchange=e=>{n.type=e.target.value;save();buildPlaces();render()};
+ document.getElementById('pd').onclick=()=>{delNode(n.id);refreshPanel();render()};
+ panel.querySelectorAll('[data-un]').forEach(b=>b.onclick=()=>{G.edges.splice(+b.dataset.un,1);save();refreshPanel();render()});
+}
+
+function findRoute(a,b){
+ const nd=nodeById(),adj={},d={},pv={},q=new Set(Object.keys(nd));
+ Object.keys(nd).forEach(k=>{adj[k]=[];d[k]=1e12});
+ G.edges.forEach((e,i)=>{const A=nd[e.a],B=nd[e.b];const w=e.w??Math.hypot(A.x-B.x,A.y-B.y)*(fl(A.floor).scale||1);adj[e.a].push([e.b,w,i]);adj[e.b].push([e.a,w,i])});
+ d[a]=0;
+ while(q.size){let u=null;q.forEach(k=>{if(u===null||d[k]<d[u])u=k});q.delete(u);if(u===b||d[u]>=1e12)break;adj[u].forEach(x=>{if(d[u]+x[1]<d[x[0]]){d[x[0]]=d[u]+x[1];pv[x[0]]=[u,x[2]]}})}
+ if(d[b]>=1e12)return null;
+ const nodes=[b],edges=[];let c=b;while(c!==a){const p=pv[c];edges.push(p[1]);c=p[0];nodes.unshift(c)}
+ return{nodes,edges,len:d[b]};
+}
+function buildSteps(){
+ const nd=nodeById(),s=route.nodes,out=[];
+ out.push({t:'Start at '+nd[s[0]].name,f:nd[s[0]].floor});
+ for(let k=1;k<s.length;k++){const a=nd[s[k-1]],b=nd[s[k]];if(a.floor!==b.floor){
+  const fa=fl(a.floor),fb=fl(b.floor);
+  const t=fa.block!==fb.block?'Go from '+fa.block+' Block to '+fb.block+' Block ('+fb.label.toLowerCase()+')':(G.floors.indexOf(fb)>G.floors.indexOf(fa)?'Take the stairs up to the ':'Take the stairs down to the ')+fb.label.toLowerCase()+(fa.block===fb.block?'':'');
+  out.push({t,f:a.floor,to:b.floor})}}
+ out.push({t:'Arrive at '+nd[s[s.length-1]].name,f:nd[s[s.length-1]].floor});
+ return out;
+}
+function showRoute(){
+ const a=places[document.getElementById('from').value.trim()],b=places[document.getElementById('to').value.trim()];
+ if(!a||!b){msg('Choose both places from the list that appears as you type.');return}
+ if(a===b){msg('Pick two different places.');return}
+ const r=findRoute(a,b);
+ if(!r){route=null;stepsEl.innerHTML='';render();msg('No route yet: these places are not connected in the map.');return}
+ route=r;const st=buildSteps();
+ stepsEl.innerHTML=st.map((x,i)=>`<div class="st" data-f="${x.f}"><span class="dot">${i+1}</span><span>${x.t}<br><small style="color:#666">${flab(x.f)}</small></span></div>`).join('');
+ stepsEl.querySelectorAll('.st').forEach((el,i)=>el.onclick=()=>{stepsEl.querySelectorAll('.st').forEach(e=>e.classList.remove('cur'));el.classList.add('cur');setFloor(el.dataset.f)});
+ setFloor(G.nodes.find(n=>n.id===a).floor);
+ const nd2=nodeById();const est=r.edges.some(i=>G.edges[i].est)||r.nodes.some(i=>fl(nd2[i].floor).est);
+ msg('Route found: '+(est?'about ':'')+Math.round(r.len)+' steps'+(est?' (estimated, only C Block is calibrated)':'')+'. Tap a step to jump to that floor.');
+}
+document.getElementById('go').onclick=showRoute;
+document.getElementById('clr').onclick=()=>{if(typeof liveStop==='function')liveStop();route=null;stepsEl.innerHTML='';render();msg('')};
+if(EDIT){
+ document.getElementById('exp').onclick=()=>{const a=document.createElement('a');a.href=URL.createObjectURL(new Blob([JSON.stringify(G,null,1)],{type:'application/json'}));a.download='graph.json';a.click()};
+ document.getElementById('rst').onclick=()=>{if(confirm('Discard all your edits and reload the original graph?')){try{localStorage.removeItem('campusGraph')}catch(e){}location.reload()}};
+}
+</script>
+<script src="live.js"></script>
+</body>
+</html>
